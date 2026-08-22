@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 type Header struct {
@@ -209,14 +211,18 @@ func encodeQuery(name string, qtype uint16) []byte {
 	return append(encodeHeader(header), encodeQuestion(question)...)
 }
 
-func sendQuery(server string, query []byte) []byte {
+func sendQuery(ctx context.Context, server string, query []byte) ([]byte, error) {
 	conn, err := net.Dial("udp", server+":53")
 
 	if err != nil {
-		panic(err)
+		return query, err
 	}
 
 	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if ok {
+		conn.SetDeadline(deadline)
+	}
 
 	conn.Write(query)
 
@@ -224,11 +230,7 @@ func sendQuery(server string, query []byte) []byte {
 
 	n, err := conn.Read(response)
 
-	if err != nil {
-		panic(err)
-	}
-
-	return response[:n]
+	return response[:n], err
 }
 
 func getGluedIP(record []ResourceRecord) string {
@@ -247,23 +249,31 @@ func getGluedIP(record []ResourceRecord) string {
 	return ""
 }
 
-func recursiveResolver(server string, query []byte) Message {
-	response := sendQuery(server, query)
+func recursiveResolver(ctx context.Context, server string, query []byte) (Message, error) {
+	response, err := sendQuery(ctx, server, query)
+
+	if err != nil {
+		return Message{}, err
+	}
+
 	decodedMessage := decodeMessage(response)
 
 	if len(decodedMessage.Answers) != 0 {
-		return decodedMessage
+		return decodedMessage, err
 	}
 
-	return recursiveResolver(getGluedIP(decodedMessage.Additional), query)
+	return recursiveResolver(ctx, getGluedIP(decodedMessage.Additional), query)
 }
 
 const rootServer = "198.41.0.4"
 
-func resolve(name string, qtype uint16) string {
+func resolve(name string, qtype uint16) (string, error) {
 	query := encodeQuery(name, qtype)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	// query to root servers; There are 13 root servers
-	answer := recursiveResolver(rootServer, query)
-	return getGluedIP(answer.Answers)
+	answer, err := recursiveResolver(ctx, rootServer, query)
+
+	return getGluedIP(answer.Answers), err
 }
