@@ -2,18 +2,22 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"strings"
 )
 
 type Header struct {
-	ID      uint16
-	Flags   uint16
-	QCount  uint16
-	ACount  uint16
-	NSCount uint16
-	ARCount uint16
+	ID      uint16 // Used by resolver to verify recieved dns query wrt sent dns query
+	Flags   uint16 // 15QR | (14-11)Opcode | 10AA | 9TC | 8RD | 7RA | (6-4)Z | (3-0)RCODE
+	QCount  uint16 // How many Questions
+	ACount  uint16 // How many Answers
+	NSCount uint16 // How many Authorities
+	ARCount uint16 // How many Additionals
 }
+
+// example.com.  172800  IN  NS  a.iana-servers.net.
+// example.com.  172800  IN  NS  b.iana-servers.net.
 
 func encodeHeader(h Header) []byte {
 	buf := make([]byte, 12)
@@ -225,4 +229,41 @@ func sendQuery(server string, query []byte) []byte {
 	}
 
 	return response[:n]
+}
+
+func getGluedIP(record []ResourceRecord) string {
+	if len(record) != 0 {
+		data := record[0].Data
+		switch record[0].Type {
+		case 0x01:
+			return fmt.Sprintf("%d.%d.%d.%d", data[0], data[1], data[2], data[3])
+		case 0x1C:
+			return fmt.Sprintf("%d.%d.%d.%d.%d.%d", data[0], data[1], data[2], data[3], data[4], data[5])
+		default:
+			return ""
+		}
+	}
+
+	return ""
+}
+
+func recursiveResolver(server string, query []byte) Message {
+	response := sendQuery(server, query)
+	decodedMessage := decodeMessage(response)
+
+	if len(decodedMessage.Answers) != 0 {
+		return decodedMessage
+	}
+
+	return recursiveResolver(getGluedIP(decodedMessage.Additional), query)
+}
+
+const rootServer = "198.41.0.4"
+
+func resolve(name string, qtype uint16) string {
+	query := encodeQuery(name, qtype)
+
+	// query to root servers; There are 13 root servers
+	answer := recursiveResolver(rootServer, query)
+	return getGluedIP(answer.Answers)
 }
