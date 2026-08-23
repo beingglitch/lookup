@@ -1,12 +1,8 @@
-package main
+package lookup
 
 import (
-	"context"
 	"encoding/binary"
-	"fmt"
-	"net"
 	"strings"
-	"time"
 )
 
 type Header struct {
@@ -18,8 +14,27 @@ type Header struct {
 	ARCount uint16 // How many Additionals
 }
 
-// example.com.  172800  IN  NS  a.iana-servers.net.
-// example.com.  172800  IN  NS  b.iana-servers.net.
+type Question struct {
+	Name  string
+	Type  uint16
+	Class uint16
+}
+
+type ResourceRecord struct {
+	Name  string
+	Type  uint16
+	Class uint16 // always IN
+	TTL   uint32
+	Data  []byte
+}
+
+type Message struct {
+	Header     Header
+	Questions  []Question
+	Answers    []ResourceRecord
+	Authority  []ResourceRecord
+	Additional []ResourceRecord
+}
 
 func encodeHeader(h Header) []byte {
 	buf := make([]byte, 12)
@@ -43,12 +58,6 @@ func decodeHeader(data []byte) Header {
 		NSCount: binary.BigEndian.Uint16(data[8:10]),
 		ARCount: binary.BigEndian.Uint16(data[10:12]),
 	}
-}
-
-type Question struct {
-	Name  string
-	Type  uint16
-	Class uint16
 }
 
 func encodeName(name string) []byte {
@@ -120,14 +129,6 @@ func decodeQuestion(data []byte, offset int) (Question, int) {
 	return question, offset + 4
 }
 
-type ResourceRecord struct {
-	Name  string
-	Type  uint16
-	Class uint16 // always IN
-	TTL   uint32
-	Data  []byte
-}
-
 func decodeResourceRecord(data []byte, offset int) (ResourceRecord, int) {
 
 	name, offset := decodeName(data, offset)
@@ -143,14 +144,6 @@ func decodeResourceRecord(data []byte, offset int) (ResourceRecord, int) {
 	}
 
 	return resourceRecord, offset + 10 + rdLength
-}
-
-type Message struct {
-	Header     Header
-	Questions  []Question
-	Answers    []ResourceRecord
-	Authority  []ResourceRecord
-	Additional []ResourceRecord
 }
 
 func decodeMessage(data []byte) Message {
@@ -209,104 +202,4 @@ func encodeQuery(name string, qtype uint16) []byte {
 	}
 
 	return append(encodeHeader(header), encodeQuestion(question)...)
-}
-
-func sendQuery(ctx context.Context, server string, query []byte) ([]byte, error) {
-	conn, err := net.Dial("udp", server+":53")
-
-	if err != nil {
-		return query, err
-	}
-
-	defer conn.Close()
-	deadline, ok := ctx.Deadline()
-	if ok {
-		conn.SetDeadline(deadline)
-	}
-
-	conn.Write(query)
-
-	response := make([]byte, 512)
-
-	n, err := conn.Read(response)
-
-	return response[:n], err
-}
-
-func getGluedIPs(records []ResourceRecord) []string {
-
-	var ips []string
-
-	for _, record := range records {
-		switch record.Type {
-		case 0x01:
-			data := record.Data
-			ips = append(ips, fmt.Sprintf("%d.%d.%d.%d", data[0], data[1], data[2], data[3]))
-		case 0x1C:
-			data := record.Data
-			ips = append(ips, fmt.Sprintf("[%x%x:%x%x:%x%x:%x%x:%x%x:%x%x:%x%x:%x%x]", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]))
-		}
-	}
-
-	return ips
-}
-
-type queryResult struct {
-	message Message
-	err     error
-}
-
-func recursiveResolver(ctx context.Context, servers []string, query []byte) (Message, error) {
-
-	ch := make(chan queryResult, len(servers))
-
-	for _, server := range servers {
-
-		go func(server string) {
-			response, err := sendQuery(ctx, server, query)
-
-			ch <- queryResult{
-				message: decodeMessage(response),
-				err:     err,
-			}
-
-		}(server)
-	}
-
-	var lastError error
-
-	for range servers {
-		select {
-		case result := <-ch:
-			if result.err != nil {
-				fmt.Printf("%v", result.err)
-				lastError = result.err
-				break
-			}
-
-			message := result.message
-
-			if len(message.Answers) > 0 {
-				return message, result.err
-			}
-
-			return recursiveResolver(ctx, getGluedIPs(message.Additional), query)
-		case <-ctx.Done():
-			return Message{}, ctx.Err()
-		}
-	}
-	return Message{}, lastError
-}
-
-var rootServer = []string{"198.41.0.4"}
-
-func resolve(name string, qtype uint16) ([]string, error) {
-	query := encodeQuery(name, qtype)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// query to root servers; There are 13 root servers
-	answer, err := recursiveResolver(ctx, rootServer, query)
-
-	return getGluedIPs(answer.Answers), err
 }
