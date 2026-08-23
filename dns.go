@@ -233,41 +233,74 @@ func sendQuery(ctx context.Context, server string, query []byte) ([]byte, error)
 	return response[:n], err
 }
 
-func getGluedIP(record []ResourceRecord) string {
-	if len(record) != 0 {
-		data := record[0].Data
-		switch record[0].Type {
+func getGluedIPs(records []ResourceRecord) []string {
+
+	var ips []string
+
+	for _, record := range records {
+		switch record.Type {
 		case 0x01:
-			return fmt.Sprintf("%d.%d.%d.%d", data[0], data[1], data[2], data[3])
+			data := record.Data
+			ips = append(ips, fmt.Sprintf("%d.%d.%d.%d", data[0], data[1], data[2], data[3]))
 		case 0x1C:
-			return fmt.Sprintf("%d.%d.%d.%d.%d.%d", data[0], data[1], data[2], data[3], data[4], data[5])
-		default:
-			return ""
+			data := record.Data
+			ips = append(ips, fmt.Sprintf("[%x%x:%x%x:%x%x:%x%x:%x%x:%x%x:%x%x:%x%x]", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]))
 		}
 	}
 
-	return ""
+	return ips
 }
 
-func recursiveResolver(ctx context.Context, server string, query []byte) (Message, error) {
-	response, err := sendQuery(ctx, server, query)
-
-	if err != nil {
-		return Message{}, err
-	}
-
-	decodedMessage := decodeMessage(response)
-
-	if len(decodedMessage.Answers) != 0 {
-		return decodedMessage, err
-	}
-
-	return recursiveResolver(ctx, getGluedIP(decodedMessage.Additional), query)
+type queryResult struct {
+	message Message
+	err     error
 }
 
-const rootServer = "198.41.0.4"
+func recursiveResolver(ctx context.Context, servers []string, query []byte) (Message, error) {
 
-func resolve(name string, qtype uint16) (string, error) {
+	ch := make(chan queryResult, len(servers))
+
+	for _, server := range servers {
+
+		go func(server string) {
+			response, err := sendQuery(ctx, server, query)
+
+			ch <- queryResult{
+				message: decodeMessage(response),
+				err:     err,
+			}
+
+		}(server)
+	}
+
+	var lastError error
+
+	for range servers {
+		select {
+		case result := <-ch:
+			if result.err != nil {
+				fmt.Printf("%v", result.err)
+				lastError = result.err
+				break
+			}
+
+			message := result.message
+
+			if len(message.Answers) > 0 {
+				return message, result.err
+			}
+
+			return recursiveResolver(ctx, getGluedIPs(message.Additional), query)
+		case <-ctx.Done():
+			return Message{}, ctx.Err()
+		}
+	}
+	return Message{}, lastError
+}
+
+var rootServer = []string{"198.41.0.4"}
+
+func resolve(name string, qtype uint16) ([]string, error) {
 	query := encodeQuery(name, qtype)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -275,5 +308,5 @@ func resolve(name string, qtype uint16) (string, error) {
 	// query to root servers; There are 13 root servers
 	answer, err := recursiveResolver(ctx, rootServer, query)
 
-	return getGluedIP(answer.Answers), err
+	return getGluedIPs(answer.Answers), err
 }
